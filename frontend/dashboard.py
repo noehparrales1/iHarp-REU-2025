@@ -26,7 +26,7 @@ DEFAULT_TITLE = "📍 Iceberg UI Project"
 
 
 # ===========================
-# 🗺️ HELPER FUNCTION: EMPTY MAP
+# 🗺️ Empty Map
 # ===========================
 def default_map():
     fig = go.Figure(go.Scattermapbox())

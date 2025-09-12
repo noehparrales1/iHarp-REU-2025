@@ -9,7 +9,12 @@ app = Flask(__name__)
 
 # Set the environment variable that tells Google where to find the credentials JSON file
 # This is needed to authenticate with Google Cloud services (like GCS)
-os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = 'icebergui-8e0eae4379f9.json'
+cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+if not cred_path or not os.path.exists(cred_path):
+    raise RuntimeError(
+        "Set GOOGLE_APPLICATION_CREDENTIALS to your service-account JSON path."
+    )
+
 
 def download_weights_from_gcs(bucket_name: str,
                               blob_name: str,
