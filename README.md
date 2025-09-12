@@ -11,14 +11,12 @@ This repository contains research and development work completed during the **NS
 
 ## Requirements
 Install dependencies with:
-```bash
 pip install -r requirements.txt
 
 
 ## Running the App
 
 ### 1. Create a virtual environment and install dependencies
-```powershell
 python -m venv .venv
 . .venv\Scripts\Activate.ps1
 pip install --upgrade pip
