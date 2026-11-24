@@ -41,3 +41,6 @@ icebergui-*.json
 
 # --- Node (if any frontend) ---
 frontend/node_modules/
+
+# --- Trained model needed by the live demo ---
+!backend/Model_LSTM_IDRIFTNET/lstm_idriftnet.weights.h5
