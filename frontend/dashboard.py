@@ -1,27 +1,37 @@
 # ===========================
 # 📦 IMPORTS
 # ===========================
-from dash import Dash, dcc, html, Input, Output, State
+import os
+import sys
+import base64
+import io
+from pathlib import Path
+
+from dash import Dash, dcc, html, Input, Output, State, ctx, dash_table
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 import pandas as pd
-import base64
-import io
-import requests
 import dash
 from geopy.distance import geodesic
-import dash_table
+
+# the model lives in ../backend/predict.py; call it directly (no separate API server)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
+from predict import run_prediction, CSV_FOLDER  # noqa: E402
+
+SAMPLE_2024 = CSV_FOLDER / "A23A_2024.xlsx"
+SAMPLE_2025 = CSV_FOLDER / "A23A_2025.xlsx"
 
 
 # ===========================
 # ⚙️ CONSTANTS & APP CONFIG
 # ===========================
-app = Dash(__name__, external_stylesheets=[dbc.themes.CYBORG])
+app = Dash(__name__, external_stylesheets=[dbc.themes.CYBORG], title="Iceberg Drift Forecasting")
+server = app.server  # used by gunicorn when hosted
 
 DEFAULT_LAT = 24.3257
 DEFAULT_LON = 6.3658
 DEFAULT_ZOOM = 1.66
-DEFAULT_MAPBOX_STYLE = "open-street-map"
+DEFAULT_MAP_STYLE = "open-street-map"
 DEFAULT_TITLE = "📍 Iceberg UI Project"
 
 
@@ -29,10 +39,10 @@ DEFAULT_TITLE = "📍 Iceberg UI Project"
 # 🗺️ Empty Map
 # ===========================
 def default_map():
-    fig = go.Figure(go.Scattermapbox())
+    fig = go.Figure(go.Scattermap())
     fig.update_layout(
-        mapbox=dict(
-            style=DEFAULT_MAPBOX_STYLE,
+        map=dict(
+            style=DEFAULT_MAP_STYLE,
             zoom=DEFAULT_ZOOM,
             center=dict(lat=DEFAULT_LAT, lon=DEFAULT_LON)
         ),
@@ -48,6 +58,42 @@ app.layout = html.Div(
     style={"backgroundColor": "#425c76", "color" : "white", "padding": "20px"},
     children=[
         html.H2(DEFAULT_TITLE, style={"textAlign": "center"}),
+        html.P(
+            "Forecasts iceberg drift with LSTM-IDRIFTNET, a physics-informed LSTM that combines past "
+            "positions, iceberg area, wind (u10, v10) and ocean currents (uo, vo). "
+            "Upload 2024 and 2025 tracks, or try the sample data below. NSF iHARP REU 2025.",
+            style={"textAlign": "center", "maxWidth": "900px", "margin": "0 auto 20px auto"}
+        ),
+
+        # ----- Sample Data Section -----
+        html.Div(
+            style={
+                "backgroundColor": "#2c3e50",
+                "padding": "15px 20px",
+                "borderRadius": "10px",
+                "maxWidth": "1000px",
+                "margin": "0 auto 20px auto",
+            },
+            children=[
+                html.H4("🧪 Try It With Sample Data", style={"marginBottom": "8px"}),
+                html.P(
+                    "Weekly observed positions of iceberg A23a for 2024 and 2025, with wind and ocean-current "
+                    "values at each position. Run the model on them in one click, or download them to see "
+                    "the file format the upload expects.",
+                    style={"marginBottom": "8px"}
+                ),
+                html.P(
+                    [html.B("Required columns: "),
+                     "Date, Latitude, Longitude, Area, u10, v10, uo, vo"],
+                    style={"fontSize": "0.9em", "marginBottom": "12px"}
+                ),
+                dbc.Button("▶ Run With Sample Data", id="sample-button", color="success", className="me-2"),
+                dbc.Button("⬇ 2024 Sample (.xlsx)", id="download-2024-btn", color="info", outline=True, className="me-2"),
+                dbc.Button("⬇ 2025 Sample (.xlsx)", id="download-2025-btn", color="info", outline=True),
+                dcc.Download(id="download-2024"),
+                dcc.Download(id="download-2025"),
+            ]
+        ),
 
         # ----- Upload and Dropdown Controls -----
         dbc.Card(
@@ -95,6 +141,8 @@ app.layout = html.Div(
                 "border": "none"
             }
         ),
+
+        html.Div(id="upload-status", style={"textAlign": "center", "marginBottom": "10px", "fontSize": "0.9em"}),
 
         # ----- Toggle Checkbox -----
         html.Div(
@@ -199,39 +247,53 @@ app.layout = html.Div(
     Output("fde-m", "children"),
     Output('stored-df', 'data'),
     Input('submit-button', 'n_clicks'),
+    Input('sample-button', 'n_clicks'),
+    Input('visualization-type', 'value'),
     State('diff-toggle', 'value'),
     State('upload-2024', 'contents'),
-    State('upload-2024', 'filename'),
     State('upload-2025', 'contents'),
-    State('upload-2025', 'filename'),
-    State('visualization-type', 'value')
+    State('stored-df', 'data'),
+    State("ade-deg", "children"),
+    State("fde-deg", "children"),
+    State("ade-m", "children"),
+    State("fde-m", "children"),
 )
-
-
-def process_upload(n_clicks, diff_toggle, content_2024, name_2024, content_2025, name_2025, viz_type):
-    if not n_clicks:
+def process_upload(n_clicks, sample_clicks, viz_type, diff_toggle, content_2024, content_2025,
+                   stored_df, cur_ade_deg, cur_fde_deg, cur_ade_m, cur_fde_m):
+    trigger = ctx.triggered_id
+    if trigger not in ("submit-button", "sample-button", "visualization-type"):
         return default_map(), "", {'display': 'none'}, 0, {},"N/A","N/A","N/A","N/A", None
-    if not content_2024 or not content_2025:
-        return default_map(), "upload both Excel files.", {'display': 'none'}, 0, {}, "N/A","N/A","N/A","N/A", None
 
-    # convert base64 content to file object
-    def to_file(content, filename):
+    # convert base64 upload content to an in-memory file
+    def to_file(content):
         content_type, content_string = content.split(',')
-        decoded = base64.b64decode(content_string)
-        return (filename, io.BytesIO(decoded), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-    #mime type 
-    files = {
-        'file_2024': to_file(content_2024, name_2024),
-        'file_2025': to_file(content_2025, name_2025),
-    }
+        return io.BytesIO(base64.b64decode(content_string))
 
     try:
-        # send files to backend flask api
-        res = requests.post("http://127.0.0.1:5000/predict", files=files)
-        if res.status_code != 200:
-            return default_map(), f"server error: {res.text}", {'display': 'none'}, 0, {}, "N/A","N/A","N/A","N/A", None
+        if trigger == "visualization-type":
+            # view changed: re-draw the last results without re-running the model
+            if not stored_df:
+                raise dash.exceptions.PreventUpdate
+            df_prev = pd.DataFrame(stored_df).reset_index(drop=True)
+            response_data = {
+                "ADE (deg)": cur_ade_deg, "FDE (deg)": cur_fde_deg,
+                "ADE (m)": cur_ade_m, "FDE (m)": cur_fde_m,
+                "trajectory": df_prev[["Date", "GT_Lat", "GT_Lon", "Pred_Lat", "Pred_Lon"]].to_dict("records"),
+            }
+        else:
+            if trigger == "sample-button":
+                file_2024, file_2025 = SAMPLE_2024, SAMPLE_2025
+            else:
+                if not content_2024 or not content_2025:
+                    return default_map(), "upload both Excel files, or use the sample data above.", {'display': 'none'}, 0, {}, "N/A","N/A","N/A","N/A", None
+                file_2024, file_2025 = to_file(content_2024), to_file(content_2025)
 
-        response_data = res.json()
+            # run the LSTM-IDRIFTNET model directly
+            try:
+                response_data = run_prediction(file_2024, file_2025)
+            except ValueError as e:
+                return default_map(), f"data error: {e}", {'display': 'none'}, 0, {}, "N/A","N/A","N/A","N/A", None
+
         df_pred = pd.DataFrame(response_data["trajectory"])
 
         ade_deg = response_data.get("ADE (deg)", "N/A")
@@ -242,14 +304,14 @@ def process_upload(n_clicks, diff_toggle, content_2024, name_2024, content_2025,
         # ----- 2d map -----
         if viz_type == "2d":
             fig = go.Figure()
-            fig.add_trace(go.Scattermapbox(
+            fig.add_trace(go.Scattermap(
                 lat=df_pred["GT_Lat"],
                 lon=df_pred["GT_Lon"],
                 mode="markers+lines",
                 name="Ground Truth",
                 marker=dict(color="blue")
             ))
-            fig.add_trace(go.Scattermapbox(
+            fig.add_trace(go.Scattermap(
                 lat=df_pred["Pred_Lat"],
                 lon=df_pred["Pred_Lon"],
                 mode="markers+lines",
@@ -258,7 +320,7 @@ def process_upload(n_clicks, diff_toggle, content_2024, name_2024, content_2025,
             ))
             if diff_toggle:
                 for i, row in df_pred.iterrows():
-                    fig.add_trace(go.Scattermapbox(
+                    fig.add_trace(go.Scattermap(
                         lat=[row["GT_Lat"], row["Pred_Lat"]],
                         lon=[row["GT_Lon"], row["Pred_Lon"]],
                         mode="lines",
@@ -268,8 +330,8 @@ def process_upload(n_clicks, diff_toggle, content_2024, name_2024, content_2025,
                         text=f"Day {i+1} error"
             ))
             fig.update_layout(
-                mapbox=dict(
-                    style=DEFAULT_MAPBOX_STYLE,
+                map=dict(
+                    style=DEFAULT_MAP_STYLE,
                     zoom=4,
                     center=dict(lat=df_pred["GT_Lat"].mean(), lon= df_pred["GT_Lon"].mean())),
                 margin=dict(r=0, t=0, l=0, b=0)
@@ -294,7 +356,7 @@ def process_upload(n_clicks, diff_toggle, content_2024, name_2024, content_2025,
             fig = go.Figure()
 
             # add ground truth points as blue line
-            fig.add_trace(go.Scattermapbox(
+            fig.add_trace(go.Scattermap(
                 lat=df_slice["GT_Lat"],
                 lon=df_slice["GT_Lon"],
                 name="Ground Truth",
@@ -303,7 +365,7 @@ def process_upload(n_clicks, diff_toggle, content_2024, name_2024, content_2025,
             ))
 
             # add predicted points as red line
-            fig.add_trace(go.Scattermapbox(
+            fig.add_trace(go.Scattermap(
                 lat=df_slice["Pred_Lat"],
                 lon=df_slice["Pred_Lon"],
                 name="Predicted",
@@ -313,8 +375,8 @@ def process_upload(n_clicks, diff_toggle, content_2024, name_2024, content_2025,
 
             # set map style, zoom, center, and other layout stuff
             fig.update_layout(
-                mapbox=dict(
-                    style=DEFAULT_MAPBOX_STYLE,
+                map=dict(
+                    style=DEFAULT_MAP_STYLE,
                     zoom=4,
                     center=dict(lat=df_pred["GT_Lat"].mean(), lon=df_pred["GT_Lon"].mean())
                 ),
@@ -347,14 +409,14 @@ def process_upload(n_clicks, diff_toggle, content_2024, name_2024, content_2025,
                 frames.append(go.Frame(
                     name=str(date.date()),  # this frame will be labeled by the current date
                     data=[
-                        go.Scattermapbox(
+                        go.Scattermap(
                             lat=sliced["GT_Lat"], 
                             lon=sliced["GT_Lon"], 
                             mode="markers+lines", 
                             marker=dict(color="blue"), 
                             name="Ground Truth"
                         ),
-                        go.Scattermapbox(
+                        go.Scattermap(
                             lat=sliced["Pred_Lat"], 
                             lon=sliced["Pred_Lon"], 
                             mode="markers+lines", 
@@ -367,14 +429,14 @@ def process_upload(n_clicks, diff_toggle, content_2024, name_2024, content_2025,
             # initialize the figure with the first data point (first date)
             fig = go.Figure(
                 data=[
-                    go.Scattermapbox(
+                    go.Scattermap(
                         lat=[df_pred["GT_Lat"].iloc[0]], 
                         lon=[df_pred["GT_Lon"].iloc[0]], 
                         mode="markers+lines", 
                         marker=dict(color="blue"), 
                         name="Ground Truth"
                     ),
-                    go.Scattermapbox(
+                    go.Scattermap(
                         lat=[df_pred["Pred_Lat"].iloc[0]], 
                         lon=[df_pred["Pred_Lon"].iloc[0]], 
                         mode="markers+lines", 
@@ -383,8 +445,8 @@ def process_upload(n_clicks, diff_toggle, content_2024, name_2024, content_2025,
                     )
                 ],
                 layout=go.Layout(
-                    mapbox=dict(
-                    style=DEFAULT_MAPBOX_STYLE,
+                    map=dict(
+                    style=DEFAULT_MAP_STYLE,
                     zoom=4,
                     center=dict(lat=df_pred["GT_Lat"].mean(), lon=df_pred["GT_Lon"].mean())
                 ),
@@ -422,6 +484,8 @@ def process_upload(n_clicks, diff_toggle, content_2024, name_2024, content_2025,
         else:
             return default_map(), "", {'display': 'none'}, 0, {}, 'N/A', 'N/A', 'N/A', 'N/A', None
 
+    except dash.exceptions.PreventUpdate:
+        raise
     except Exception as e:
         return default_map(), f"frontend error: {str(e)}", {'display': 'none'}, 0, {}, 'N/A', 'N/A', 'N/A', 'N/A', None 
 
@@ -453,14 +517,14 @@ def update_2d_slider_map(slider_value, current_fig, viz_type):
 
     # build new map figure with updated data
     fig = go.Figure()
-    fig.add_trace(go.Scattermapbox(
+    fig.add_trace(go.Scattermap(
         lat=df_slice["GT_Lat"],
         lon=df_slice["GT_Lon"],
         name="Ground Truth",
         mode="markers+lines",
         marker=dict(color="blue")
     ))
-    fig.add_trace(go.Scattermapbox(
+    fig.add_trace(go.Scattermap(
         lat=df_slice["Pred_Lat"],
         lon=df_slice["Pred_Lon"],
         name="Predicted",
@@ -471,8 +535,8 @@ def update_2d_slider_map(slider_value, current_fig, viz_type):
     # update layout with map styling and store data again
     
     fig.update_layout(
-        mapbox=dict(
-            style=DEFAULT_MAPBOX_STYLE,
+        map=dict(
+            style=DEFAULT_MAP_STYLE,
             zoom=4,
             center=dict(lat=df_pred["GT_Lat"].mean(), lon=df_pred["GT_Lon"].mean())
         ),
@@ -520,7 +584,7 @@ def update_diff_lines(toggle, fig, df_dict, viz_type):
     
     for idx, (_, row) in enumerate(df.iterrows()):
         fig['data'].append(
-            go.Scattermapbox(
+            go.Scattermap(
                 lat=[row["GT_Lat"], row["Pred_Lat"]],
                 lon=[row["GT_Lon"], row["Pred_Lon"]],
                 mode="lines",
@@ -602,6 +666,41 @@ def update_summary_table(df_dict):
     return generate_summary_table(df)
 
 
+# ===========================
+# 🔁 CALLBACKS: Sample Downloads + Upload Status
+# ===========================
+@app.callback(Output("download-2024", "data"), Input("download-2024-btn", "n_clicks"), prevent_initial_call=True)
+def download_sample_2024(_):
+    return dcc.send_file(str(SAMPLE_2024))
+
+
+@app.callback(Output("download-2025", "data"), Input("download-2025-btn", "n_clicks"), prevent_initial_call=True)
+def download_sample_2025(_):
+    return dcc.send_file(str(SAMPLE_2025))
+
+
+@app.callback(
+    Output("date-slider", "value", allow_duplicate=True),
+    Input("visualization-type", "value"),
+    Input("stored-df", "data"),
+    prevent_initial_call=True,
+)
+def reset_slider(_viz, _data):
+    # new view or new results: start the slider at the first date
+    return 0
+
+
+@app.callback(
+    Output("upload-status", "children"),
+    Input("upload-2024", "filename"),
+    Input("upload-2025", "filename"),
+)
+def show_upload_status(name_2024, name_2025):
+    if not name_2024 and not name_2025:
+        return ""
+    return f"2024 file: {name_2024 or '—'}   |   2025 file: {name_2025 or '—'}"
+
+
 # ----- run app -----
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=os.environ.get("DASH_DEBUG", "1") == "1", port=int(os.environ.get("PORT", 8050)))
