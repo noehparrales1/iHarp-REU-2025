@@ -65,7 +65,7 @@ Data Engineering & Feature Processing
 
 ## Live Demo
 
-**Live demo:** _link coming soon_
+**Live demo:** https://iceberg-drift-forecasting.onrender.com  _(free hosting — the first load after a period of inactivity can take about a minute)_
 
 Upload a 2024 and a 2025 `.xlsx` track (columns: `Date, Latitude, Longitude, Area, u10, v10, uo, vo`), or click **Run With Sample Data** to run the model on iceberg A23a. The dashboard shows predicted vs. observed positions on a map, with ADE/FDE error metrics and a per-week error table.
 
