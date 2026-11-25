@@ -2,14 +2,19 @@
 LSTM-IDRIFTNET inference.
 
 `run_prediction(file_2024, file_2025)` is called directly by the dashboard.
+
+The forward pass is written in NumPy and uses the trained Keras weights from
+Model_LSTM_IDRIFTNET/, so the hosted demo does not need TensorFlow. The Keras
+model it mirrors is in backend/model_tf.py; backend/check_numpy_matches_tf.py
+checks that both produce the same predictions.
+
 Running this file starts the original standalone Flask API (POST /predict).
 """
-import os
 import pathlib
 
+import h5py
 import numpy as np
 import pandas as pd
-import tensorflow as tf
 from sklearn.preprocessing import MinMaxScaler
 from geopy.distance import geodesic
 
@@ -26,49 +31,72 @@ SEQ_LEN = 5
 # ===========================
 rho_air, rho_water, rho_ice = 1.2, 1027, 850
 Ca, Cw, f = 0.9, 1.3, 1e-4
-_g = tf.sqrt((rho_air*(rho_water-rho_ice))/(rho_water*rho_ice)*(Ca/Cw))
+_g = np.float32(np.sqrt((rho_air*(rho_water-rho_ice))/(rho_water*rho_ice)*(Ca/Cw)))
 
 
-@tf.function
 def physics_model(tw):
-    u10, v10, uo, vo, area, lat_p, lon_p = tf.split(tw, 7, axis=-1)
-    va = tf.concat([u10, v10], -1)
-    vw = tf.concat([uo, vo], -1)
-    va_mag = tf.norm(va, axis=-1, keepdims=True)
-    S = tf.where(area > 0, area*1e6/(2*tf.sqrt(area*1e6)), tf.zeros_like(area))
-    L = tf.where(S > 0, _g*Cw/(np.pi*f)*va_mag/S, tf.zeros_like(S))
-    L4 = L**4; sq = tf.sqrt(1.+4.*L4)
-    a = tf.where(L > 0, 1./(2.*L**3)*(sq-1.), tf.zeros_like(L))
-    b = tf.where(L > 0, 1./(tf.sqrt(2.)*L**3)*tf.sqrt(tf.maximum((1.+L4)*sq-3.*L4-1., 0)), tf.zeros_like(L))
-    k_cross = tf.concat([-va[..., 1:2], va[..., 0:1]], -1)
+    """tw: (batch, 7) = u10, v10, uo, vo, area, prev_lat, prev_lon  →  (batch, 2) lat, lon"""
+    u10, v10, uo, vo, area, lat_p, lon_p = np.split(tw, 7, axis=-1)
+    va = np.concatenate([u10, v10], -1)
+    vw = np.concatenate([uo, vo], -1)
+    va_mag = np.linalg.norm(va, axis=-1, keepdims=True)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        S = np.where(area > 0, area*1e6/(2*np.sqrt(area*1e6)), 0.0)
+        L = np.where(S > 0, _g*Cw/(np.pi*f)*va_mag/S, 0.0)
+        L4 = L**4
+        sq = np.sqrt(1. + 4.*L4)
+        a = np.where(L > 0, 1./(2.*L**3)*(sq-1.), 0.0)
+        b = np.where(L > 0, 1./(np.sqrt(2.)*L**3)*np.sqrt(np.maximum((1.+L4)*sq-3.*L4-1., 0)), 0.0)
+    k_cross = np.concatenate([-va[..., 1:2], va[..., 0:1]], -1)
     wind = _g*(-a*k_cross + b*va)
     vi = (vw + wind)*0.8
     lat = lat_p + vi[..., 1:2]*0.01
     lon = lon_p + vi[..., 0:1]*0.01
-    return tf.concat([lat, lon], -1)
+    return np.concatenate([lat, lon], -1)
 
 
 # ===========================
-# Model
+# NumPy forward pass of the trained network
 # ===========================
-class LSTM_IDRIFTNET(tf.keras.Model):
-    def __init__(self, units=64):
-        super().__init__()
-        self.lstm = tf.keras.layers.LSTM(units, return_sequences=True)
-        self.lstm2 = tf.keras.layers.LSTM(units)
-        self.fc1 = tf.keras.layers.Dense(128, activation='relu')
-        self.fc2 = tf.keras.layers.Dense(64, activation='relu')
-        self.out = tf.keras.layers.Dense(2)
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
 
-    def call(self, inputs, training=False):
-        x_seq, tw = inputs
-        x = self.lstm(x_seq)
-        x = self.lstm2(x)
+
+def _lstm(x_seq, kernel, recurrent_kernel, bias, return_sequences):
+    """Keras LSTM (tanh / sigmoid, gate order i, f, c, o). x_seq: (batch, time, features)."""
+    units = recurrent_kernel.shape[0]
+    h = np.zeros((x_seq.shape[0], units), np.float32)
+    c = np.zeros_like(h)
+    outputs = []
+    for t in range(x_seq.shape[1]):
+        z = x_seq[:, t] @ kernel + h @ recurrent_kernel + bias
+        i, fg, g, o = np.split(z, 4, axis=-1)
+        c = _sigmoid(fg) * c + _sigmoid(i) * np.tanh(g)
+        h = _sigmoid(o) * np.tanh(c)
+        outputs.append(h)
+    return np.stack(outputs, axis=1) if return_sequences else h
+
+
+class NumpyLSTMIDriftNet:
+    """Same architecture as LSTM_IDRIFTNET in model_tf.py, loaded from the Keras weights file."""
+
+    def __init__(self, weights_path=MODEL_WEIGHTS):
+        with h5py.File(weights_path, 'r') as w:
+            read = lambda path: [w[f"{path}/vars/{k}"][()] for k in sorted(w[f"{path}/vars"].keys(), key=int)]
+            self.lstm1 = read("layers/lstm/cell")      # kernel, recurrent_kernel, bias
+            self.lstm2 = read("layers/lstm_1/cell")
+            self.fc1 = read("fc1")                     # kernel, bias
+            self.fc2 = read("fc2")
+            self.out = read("layers/dense_2")
+
+    def __call__(self, x_seq, tw):
+        x = _lstm(x_seq, *self.lstm1, return_sequences=True)
+        x = _lstm(x, *self.lstm2, return_sequences=False)
         residual = physics_model(tw)
-        x = tf.concat([x, tw], axis=-1)
-        x = self.fc1(x)
-        x = self.fc2(x)
-        delta = self.out(x)
+        x = np.concatenate([x, tw], axis=-1)
+        x = np.maximum(x @ self.fc1[0] + self.fc1[1], 0)
+        x = np.maximum(x @ self.fc2[0] + self.fc2[1], 0)
+        delta = x @ self.out[0] + self.out[1]
         return residual + delta
 
 
@@ -76,16 +104,10 @@ _model = None
 
 
 def get_model():
-    """Build the model and load the trained weights once, then reuse it."""
+    """Load the trained weights once, then reuse the model."""
     global _model
     if _model is None:
-        model = LSTM_IDRIFTNET()
-        # Run one dummy forward pass so every sub-layer is built. In Keras 3,
-        # model.build() alone leaves the LSTM/Dense layers unbuilt, so the
-        # saved weights would not be loaded into them.
-        model((tf.zeros((1, SEQ_LEN, len(FEATURE_COLS))), tf.zeros((1, 7))), training=False)
-        model.load_weights(str(MODEL_WEIGHTS))
-        _model = model
+        _model = NumpyLSTMIDriftNet()
     return _model
 
 
@@ -114,12 +136,8 @@ def _build_seq(df):
     return np.array(X, np.float32), np.array(y, np.float32), np.array(tw, np.float32), dates
 
 
-def run_prediction(file_2024, file_2025):
-    """
-    file_2024 / file_2025: path or file-like object for an .xlsx with columns
-    Date, Latitude, Longitude, Area, u10, v10, uo, vo.
-    Returns metrics plus the predicted vs. ground-truth trajectory.
-    """
+def prepare_inputs(file_2024, file_2025):
+    """Read both files and build the scaled model inputs (shared with the TF check script)."""
     df_val = _read_year(file_2024, 2024)
     df_test = _read_year(file_2025, 2025)
 
@@ -134,18 +152,28 @@ def run_prediction(file_2024, file_2025):
     scaler.fit(inference_df[FEATURE_COLS])
     inference_df_scaled = inference_df.copy()
     inference_df_scaled[FEATURE_COLS] = scaler.transform(inference_df[FEATURE_COLS])
+    return scaler, _build_seq(inference_df_scaled)
 
-    X_inf, y_inf, tw_inf, dates_inf = _build_seq(inference_df_scaled)
-    model = get_model()
 
-    # autoregressive rollout: feed each prediction back into the input window
+def rollout(model, X_inf, tw_inf):
+    """Autoregressive rollout: feed each prediction back into the input window."""
     preds, x_seq = [], X_inf[:1]
     for i in range(len(tw_inf)):
-        pred = model((x_seq, tf.convert_to_tensor(tw_inf[i:i+1], tf.float32)), training=False).numpy()[0]
+        pred = np.asarray(model(x_seq, tw_inf[i:i+1]))[0]
         preds.append(pred)
         x_new = np.vstack([x_seq[0, 1:], np.hstack([pred, tw_inf[i][2:]])])
-        x_seq = tf.convert_to_tensor([x_new], dtype=tf.float32)
-    final_pred = np.array(preds)
+        x_seq = np.array([x_new], dtype=np.float32)
+    return np.array(preds)
+
+
+def run_prediction(file_2024, file_2025):
+    """
+    file_2024 / file_2025: path or file-like object for an .xlsx with columns
+    Date, Latitude, Longitude, Area, u10, v10, uo, vo.
+    Returns metrics plus the predicted vs. ground-truth trajectory.
+    """
+    scaler, (X_inf, y_inf, tw_inf, dates_inf) = prepare_inputs(file_2024, file_2025)
+    final_pred = rollout(get_model(), X_inf, tw_inf)
 
     zp = np.zeros((len(final_pred), len(FEATURE_COLS)-2))
     pred_inv = scaler.inverse_transform(np.hstack([final_pred, zp]))[:, :2]

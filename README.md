@@ -81,7 +81,9 @@ python frontend/dashboard.py
 
 The dashboard calls the model in `backend/predict.py` directly and loads the trained weights from `backend/Model_LSTM_IDRIFTNET/`. No separate server or cloud credentials are needed.
 
-To build the hosted version (Docker, port 7860): `docker build -t iceberg-demo . && docker run -p 7860:7860 iceberg-demo`
+**How inference works:** the model was built and trained in TensorFlow/Keras (`backend/model_tf.py`). For the hosted demo, `backend/predict.py` runs the same forward pass (two LSTM layers, dense layers, and the physics-based drift residual) in NumPy using the trained weights, so the app doesn't need TensorFlow and fits on a small free server. `backend/check_numpy_matches_tf.py` confirms the two implementations agree (max difference ~1e-7).
+
+**Hosting:** deployed on Render's free tier using `render.yaml`. The free instance sleeps when idle, so the first visit after a while can take about a minute to load.
 
 ---
 
